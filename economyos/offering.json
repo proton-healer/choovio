@@ -1,0 +1,57 @@
+{
+  "name": "Shopping Comparison",
+  "description": "Choovio researches real products for a shopping need (or compares up to 5 product links) and returns a sourced purchase recommendation: best choice, two alternatives, comparison table, known and unknown costs, reasons to avoid each, and links — with sources, check times and uncertainties. Advice only: Choovio never purchases, moves funds, or handles retailer credentials. Rankings are never influenced by affiliate commission.",
+  "priceType": "fixed",
+  "priceValue": 0.5,
+  "slaMinutes": 5,
+  "requirements": {
+    "type": "object",
+    "properties": {
+      "request": {
+        "type": "string",
+        "description": "What the buyer needs, in plain language. Required unless product_urls is given.",
+        "maxLength": 2000
+      },
+      "product_urls": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "uri"
+        },
+        "maxItems": 5,
+        "description": "Up to 5 public product page URLs to compare."
+      },
+      "budget": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "description": "Maximum total spend per item."
+      },
+      "currency": {
+        "type": "string",
+        "pattern": "^[A-Z]{3}$",
+        "description": "ISO-4217 currency code, e.g. USD."
+      },
+      "delivery_country": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$",
+        "description": "ISO-3166 alpha-2 delivery country, e.g. US. No street address."
+      },
+      "preferences": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "maxItems": 10,
+        "description": "What matters most, e.g. 'comfortable for long calls'."
+      }
+    },
+    "required": [
+      "delivery_country"
+    ],
+    "additionalProperties": false
+  },
+  "deliverable": "JSON: { status: complete|partial|insufficient, checked_at, best, alternatives[2], comparison_table, costs, avoid_if, links, sources[{url,kind,checked_at}], uncertainties, disclosures, summary_markdown }",
+  "requiredFunds": false,
+  "hidden": false
+}

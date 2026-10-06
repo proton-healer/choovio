@@ -1,0 +1,32 @@
+{
+  "name": "choovio",
+  "version": "0.1.0",
+  "description": "Choovio — everyday shopping assistant. Choose well. Buy with confidence. EconomyOS / Virtuals ACP provider.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "provider": "tsx src/acp/provider.ts",
+    "offering:register": "tsx scripts/register-offering.ts",
+    "agent:profile": "tsx scripts/agent-profile.ts",
+    "cli": "tsx scripts/compare-cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@x402/core": "^2.28.0",
+    "@x402/evm": "^2.28.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.3"
+  }
+}
