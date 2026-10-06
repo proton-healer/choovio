@@ -87,6 +87,16 @@ export const config = {
     /** Public base URL used in the payment's resource info, e.g. https://api.choovio.com */
     publicUrl: (process.env.CHOOVIO_PUBLIC_URL || "").replace(/\/+$/, ""),
   },
+
+  /** Nevermined plan credits on the paid route. Off unless NVM_API_KEY and NVM_PLAN_ID are set. */
+  nevermined: {
+    apiKey: process.env.NVM_API_KEY || "",
+    planId: process.env.NVM_PLAN_ID || "",
+    agentId: process.env.NVM_AGENT_ID || "",
+    environment: (process.env.NVM_ENVIRONMENT || "live").trim().toLowerCase() === "sandbox" ? ("sandbox" as const) : ("live" as const),
+    /** Credits burned per successful comparison; match "Credits per request" on the plan. */
+    creditsPerRequest: num("NVM_CREDITS_PER_REQUEST", 1),
+  },
 };
 
 function x402Network(raw: string): `${string}:${string}` {

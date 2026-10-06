@@ -15,6 +15,7 @@ import { createLlmHelper } from "./research/llm.js";
 import { liveFx } from "./research/fx.js";
 import { createSearchProvider } from "./research/search.js";
 import { liveResearcher } from "./acp/provider.js";
+import { httpNeverminedFacilitator } from "./x402/nevermined.js";
 import { createPaidCompareHandler, createX402Server, PAID_PATH } from "./x402/paid.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -69,6 +70,8 @@ const demoFetcher = new FixtureFetcher(demoPages());
 const demoSearch = new DemoSearchProvider();
 
 // Pay-per-request API for agents (x402). Enabled when a payout address is configured.
+const nvm = config.nevermined;
+const nvmEnabled = Boolean(nvm.apiKey && nvm.planId);
 const paidCompare = config.x402.payTo
   ? createPaidCompareHandler({
       httpServer: createX402Server(config.x402),
@@ -76,6 +79,7 @@ const paidCompare = config.x402.payTo
       maxConcurrent: config.x402.maxConcurrent,
       send,
       readBody: (req) => readBody(req),
+      ...(nvmEnabled ? { nevermined: { settings: nvm, facilitator: httpNeverminedFacilitator(nvm.apiKey, nvm.environment) } } : {}),
     })
   : null;
 
@@ -158,4 +162,5 @@ server.listen(config.port, config.host, () => {
   console.log(`  LLM assist:  ${s.llm ? `on (${config.model})` : "off — optional, set OPENAI_API_KEY"}`);
   console.log(`  demo mode:   ${s.demoAllowed ? "available (clearly labeled)" : "disabled"}`);
   console.log(`  paid API:    ${paidCompare ? `POST ${PAID_PATH} at $${config.x402.priceUsd} on ${config.x402.network} (x402)` : "off — set CHOOVIO_X402_PAY_TO to enable"}`);
+  if (paidCompare) console.log(`  NVM plan:    ${nvmEnabled ? `on (${nvm.environment}, ${nvm.creditsPerRequest} credit/request)` : "off — set NVM_API_KEY and NVM_PLAN_ID to accept plan credits"}`);
 });

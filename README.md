@@ -73,7 +73,7 @@ src/
 web/          index.html Â· app.js Â· styles.css (ivory / deep teal / coral)
 economyos/    agent-profile.json Â· offering.json
 scripts/      register-offering.ts Â· agent-profile.ts Â· compare-cli.ts
-test/         intent Â· security Â· scenarios Â· acp Â· x402
+test/         intent Â· security Â· scenarios Â· acp Â· x402 Â· nevermined
 ```
 
 ## EconomyOS / ACP
@@ -157,6 +157,7 @@ The `exact` scheme moves funds only at settlement, which runs after research suc
 1. **Try it on testnet.** Set `CHOOVIO_X402_PAY_TO=<your wallet>` and run `npm start`. `curl -i http://127.0.0.1:8787/api/compare` should return `402`.
 2. **Deploy.** Push the repo to GitHub and create a Railway (or Render) service from it. The `Dockerfile` is picked up automatically. Copy your `.env` values into the service's variables, plus `CHOOVIO_X402_NETWORK=base` and `CHOOVIO_PUBLIC_URL=<the https URL it gives you>`. Use an always-on plan: free tiers that sleep can fail Nevermined's health probe.
 3. **List it.** In the Nevermined app (Live), register an organization agent with endpoint `<public URL>/api/compare`, then submit it to the Catalog under *Search & Research*.
+4. **Accept plan credits (optional).** To serve buyers who bought the agent's plan through its checkout link, set `NVM_API_KEY`, `NVM_PLAN_ID`, `NVM_AGENT_ID` and `NVM_ENVIRONMENT=live`. The `402` then offers the plan (`nvm:erc4337`) next to the USDC price. A plan token is checked with Nevermined, the research runs, and credits are burned only when a recommendation comes back. The rules in the table above apply to both kinds of payment.
 
 ## Credentials
 
@@ -165,6 +166,7 @@ The `exact` scheme moves funds only at settlement, which runs after research suc
 | `TAVILY_API_KEY`, `SERPER_API_KEY`, `BRAVE_SEARCH_API_KEY` (any one; `CHOOVIO_SEARCH_PROVIDER` picks) | Open-ended live search, independent-review lookup | Pasted links and demo mode still work |
 | `OPENAI_API_KEY` (optional; also a search fallback) | Better request understanding; spec and complaint extraction from page text | Deterministic parsing and extraction only |
 | `CHOOVIO_X402_PAY_TO` (+ a mainnet facilitator for real payments) | The x402 paid API and a Nevermined Catalog listing | `/api/compare` is off |
+| `NVM_API_KEY` + `NVM_PLAN_ID` (+ `NVM_AGENT_ID`) | Accepting Nevermined plan credits on `/api/compare` | Only direct USDC payments are accepted |
 | ACP sign-in + approved signer (`acp configure`, `acp agent add-signer`) | Selling the offering on ACP | Web app works fully; the provider can't accept jobs |
 
 ## Tests

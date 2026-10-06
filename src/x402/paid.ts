@@ -6,16 +6,21 @@
  *   payment + valid request          → verify → research → settle → 200 + PAYMENT-RESPONSE
  *     └─ research fails or is "insufficient" → payment is cancelled, never settled; the caller pays nothing
  *
+ * Two kinds of payment are accepted: a direct USDC payment ("exact" scheme) and,
+ * when configured, a Nevermined plan token ("nvm:erc4337", credits bought through
+ * the plan's checkout). Both follow the same verify → research → settle order.
+ *
  * The "exact" scheme only moves funds at settlement, so the caller is charged
  * only for a recommendation Choovio can back up.
  */
 import type http from "node:http";
 import { HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer, type FacilitatorClient, type HTTPAdapter, type HTTPRequestContext, type HTTPResponseInstructions, type RouteConfig } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
-import { DELIVERABLE_DESCRIPTION, OFFERING_DESCRIPTION, REQUIREMENT_JSON_SCHEMA, toDeliverable, validateRequirement } from "../acp/offering.js";
+import { DELIVERABLE_DESCRIPTION, OFFERING_DESCRIPTION, REQUIREMENT_JSON_SCHEMA, toDeliverable, validateRequirement, type Requirement } from "../acp/offering.js";
 import { requirementToInput, type Researcher } from "../acp/provider.js";
 import { config } from "../config.js";
 import { missingQuestions, parseRequest } from "../research/intent.js";
+import { encodeHeader, isNeverminedToken, neverminedAccept, neverminedPaymentRequired, type NeverminedFacilitator, type NeverminedSettings } from "./nevermined.js";
 
 export const PAID_PATH = "/api/compare";
 
@@ -94,6 +99,8 @@ export interface PaidCompareDeps {
   send: Send;
   readBody: (req: http.IncomingMessage) => Promise<string>;
   log?: (msg: string) => void;
+  /** Also accept Nevermined plan credits. */
+  nevermined?: { settings: NeverminedSettings; facilitator: NeverminedFacilitator };
 }
 
 /** Returns the request handler for the paid route. Call `ready` once at startup. */
@@ -106,7 +113,25 @@ export function createPaidCompareHandler(deps: PaidCompareDeps) {
     log(`facilitator setup failed, paid API disabled: ${initError}`);
   });
 
-  const writeInstructions = (res: http.ServerResponse, r: HTTPResponseInstructions): void => {
+  const nvm = deps.nevermined;
+
+  /** Advertise the Nevermined plan next to the USDC price in every 402. */
+  const withPlan = (headers: Record<string, string>, method: string): Record<string, string> => {
+    if (!nvm) return headers;
+    const entry = Object.entries(headers).find(([k]) => k.toLowerCase() === "payment-required");
+    if (!entry) return headers;
+    const [key, value] = entry;
+    try {
+      const pr = JSON.parse(Buffer.from(value, "base64").toString("utf8")) as { accepts?: unknown[] };
+      pr.accepts = [...(pr.accepts ?? []), neverminedAccept(nvm.settings, method === "GET" ? "POST" : method)];
+      return { ...headers, [key]: encodeHeader(pr) };
+    } catch {
+      return headers;
+    }
+  };
+
+  const writeInstructions = (res: http.ServerResponse, r: HTTPResponseInstructions, method = "POST"): void => {
+    if (r.status === 402) r = { ...r, headers: withPlan(r.headers, method) };
     if (r.isHtml) {
       res.writeHead(r.status, { ...r.headers, "content-type": "text/html; charset=utf-8" });
       res.end(String(r.body ?? ""));
@@ -114,6 +139,52 @@ export function createPaidCompareHandler(deps: PaidCompareDeps) {
     }
     deps.send(res, r.status, r.body ?? {}, r.headers);
   };
+
+  /** Nevermined plan token: verify credits → research → burn credits only on success. */
+  async function payWithPlan(res: http.ServerResponse, token: string, requirement: Requirement, endpoint: string): Promise<void> {
+    const { settings, facilitator } = nvm!;
+    const paymentRequired = neverminedPaymentRequired(settings, endpoint, "POST");
+    const maxAmount = String(settings.creditsPerRequest);
+    const planHeader = { "payment-required": encodeHeader(paymentRequired) };
+
+    let verified;
+    try {
+      verified = await facilitator.verify({ paymentRequired, x402AccessToken: token, maxAmount });
+    } catch (e) {
+      log(`nevermined verify unreachable: ${(e as Error).message}`);
+      return deps.send(res, 502, { error: "Could not reach Nevermined to check your plan. You were not charged.", charged: false });
+    }
+    if (!verified.isValid) return deps.send(res, 402, { error: `Plan payment not accepted: ${verified.invalidReason ?? "invalid token"}`, charged: false }, planHeader);
+
+    active++;
+    try {
+      let rec;
+      try {
+        rec = await deps.research(requirement);
+      } catch (e) {
+        log(`research failed, plan credits not burned: ${(e as Error).message}`);
+        return deps.send(res, 502, { error: "Research failed. You were not charged.", charged: false });
+      }
+      const deliverable = toDeliverable(rec);
+      if (rec.status === "insufficient") {
+        return deps.send(res, 422, { ...deliverable, charged: false, note: "Choovio could not verify enough facts for a recommendation, so no plan credits were used." });
+      }
+      let settled;
+      try {
+        settled = await facilitator.settle({ paymentRequired, x402AccessToken: token, maxAmount, agentRequestId: verified.agentRequest?.agentRequestId ?? verified.agentRequestId });
+      } catch (e) {
+        settled = { success: false, errorReason: (e as Error).message };
+      }
+      if (!settled.success) {
+        log(`nevermined settlement failed: ${settled.errorReason ?? "unknown"}`);
+        return deps.send(res, 402, { error: "Your plan credits could not be redeemed, so the result was withheld.", reason: settled.errorReason, charged: false }, planHeader);
+      }
+      log(`nevermined settled ${settled.creditsRedeemed ?? maxAmount} credit(s) tx ${settled.transaction ?? "-"} (${rec.status})`);
+      deps.send(res, 200, { ...deliverable, charged: true }, { "payment-response": encodeHeader(settled) });
+    } finally {
+      active--;
+    }
+  }
 
   return async function handlePaidCompare(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     await ready;
@@ -142,6 +213,7 @@ export function createPaidCompareHandler(deps: PaidCompareDeps) {
       const questions = missingQuestions(parseRequest(requirementToInput(requirement.value)));
       if (questions.length) return deps.send(res, 400, { error: "More detail is needed before Choovio can research this.", questions, charged: false });
       if (active >= deps.maxConcurrent) return deps.send(res, 503, { error: "Busy, please retry shortly.", charged: false }, { "retry-after": "30" });
+      if (nvm && isNeverminedToken(paymentHeader)) return payWithPlan(res, paymentHeader, requirement.value, new URL(req.url ?? "/", "http://x").pathname);
     }
 
     let body: unknown;
@@ -152,7 +224,7 @@ export function createPaidCompareHandler(deps: PaidCompareDeps) {
     }
     const context: HTTPRequestContext = { adapter: adapterFor(req, body), path: new URL(req.url ?? "/", "http://x").pathname, method: req.method ?? "GET", paymentHeader };
     const result = await deps.httpServer.processHTTPRequest(context);
-    if (result.type === "payment-error") return writeInstructions(res, result.response);
+    if (result.type === "payment-error") return writeInstructions(res, result.response, req.method ?? "POST");
     if (result.type === "no-payment-required" || !requirement?.ok) return deps.send(res, 500, { error: "Payment configuration error." });
 
     active++;
