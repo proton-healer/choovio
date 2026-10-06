@@ -390,7 +390,7 @@ code { font-size: 0.9em; padding: 0.05em 0.35em; border-radius: 5px; background:
   animation: spin 0.75s linear infinite;
 }
 .spinner--accent { color: var(--accent); }
-
+.spinner--sm { width: 11px; height: 11px; border-width: 1.5px; }
 /* Alerts & notices */
 .alert, .notice {
   display: flex; align-items: flex-start; gap: 10px;

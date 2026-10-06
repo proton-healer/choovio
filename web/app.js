@@ -242,6 +242,9 @@ function addUser(text) {
 }
 
 const STEPS = ["Understanding your request", "Searching stores", "Reading product pages", "Comparing prices & reviews"];
+// Server research stages → step index (and an optional more specific label).
+const STAGE_STEP = { searching: 1, reading: 2, discovering: 2, analyzing: 3, reviews: 3 };
+const STAGE_LABEL = { reading: "Reading product pages", discovering: "Finding products reviewers recommend", analyzing: "Comparing prices & reviews", reviews: "Checking independent reviews" };
 
 function addTyping() {
   const { box, body } = botShell("loading");
@@ -263,17 +266,26 @@ function addTyping() {
 
   let i = 0;
   items[0].classList.add("is-active");
-  const timer = setInterval(() => {
-    if (i >= items.length - 1) return;
-    items[i].classList.remove("is-active");
-    items[i].classList.add("is-done");
-    items[i].querySelector(".step-dot").appendChild(icon("check", 12));
-    i += 1;
-    items[i].classList.add("is-active");
-  }, 2300);
+  const advanceTo = (target) => {
+    while (i < Math.min(target, items.length - 1)) {
+      items[i].classList.remove("is-active");
+      items[i].classList.add("is-done");
+      items[i].querySelector(".step-dot").appendChild(icon("check", 12));
+      i += 1;
+      items[i].classList.add("is-active");
+    }
+  };
 
   scrollDown();
-  return { remove() { clearInterval(timer); box.remove(); } };
+  return {
+    box,
+    setStage(stage) {
+      advanceTo(STAGE_STEP[stage] ?? i);
+      const label = STAGE_LABEL[stage];
+      if (label) items[i].querySelector(".step-label").textContent = label;
+    },
+    remove() { box.remove(); },
+  };
 }
 
 function addError(text) {
@@ -311,7 +323,7 @@ function iconList(items, iconName, cls) {
 }
 
 function renderCard(rec, sp, role, tradeoff) {
-  const node = el("article", { class: `card card--${role}` });
+  const node = el("article", { class: `card card--${role}`, "data-pid": sp.product.id });
   const offer = sp.bestOffer;
   const name = sp.product.name + (sp.product.variant ? ` (${sp.product.variant})` : "");
 
@@ -428,17 +440,24 @@ function sectionHead(title, iconName, count) {
   return h;
 }
 
-function renderRecommendation(rec, notice) {
-  const { box, body } = botShell("result");
+/** Builds a result message. `partial` marks an interim "best so far" view while research continues. */
+function buildRecommendation(rec, notice, partial = false) {
+  const { box, body } = botShell(partial ? "result result--partial" : "result");
 
   const head = el("div", { class: "result-head" });
   if (rec.dataMode === "demo") head.appendChild(el("span", { class: "pill pill--demo" }, "DEMO DATA"));
-  const statusLabel = { complete: "Research complete", partial: "Partial research", insufficient: "Not enough verified info" }[rec.status];
-  const tone = rec.status === "complete" ? "ok" : rec.status === "partial" ? "warn" : "bad";
-  const sp = el("span", { class: `pill pill--${tone}` });
-  sp.append(icon(rec.status === "complete" ? "checkCircle" : "alert", 13), document.createTextNode(statusLabel ?? String(rec.status)));
-  head.appendChild(sp);
-  head.appendChild(el("span", { class: "result-count" }, `${rec.products.length} product${rec.products.length === 1 ? "" : "s"} compared`));
+  if (partial) {
+    const sp = el("span", { class: "pill pill--neutral" });
+    sp.append(el("span", { class: "spinner spinner--sm", "aria-hidden": "true" }), document.createTextNode("Still searching — results so far"));
+    head.appendChild(sp);
+  } else {
+    const statusLabel = { complete: "Research complete", partial: "Partial research", insufficient: "Not enough verified info" }[rec.status];
+    const tone = rec.status === "complete" ? "ok" : rec.status === "partial" ? "warn" : "bad";
+    const sp = el("span", { class: `pill pill--${tone}` });
+    sp.append(icon(rec.status === "complete" ? "checkCircle" : "alert", 13), document.createTextNode(statusLabel ?? String(rec.status)));
+    head.appendChild(sp);
+  }
+  head.appendChild(el("span", { class: "result-count" }, `${rec.products.length} product${rec.products.length === 1 ? "" : "s"} ${partial ? "found so far" : "compared"}`));
   body.appendChild(head);
 
   if (notice) {
@@ -449,7 +468,10 @@ function renderRecommendation(rec, notice) {
 
   const byId = new Map(rec.products.map((p) => [p.product.id, p]));
   const lead = el("div", { class: "lead" });
-  if (!rec.best) {
+  if (partial) {
+    const best = rec.best && byId.get(rec.best.productId);
+    lead.appendChild(el("p", {}, best ? `Leading so far: the ${best.product.name}. I'm still checking more stores and reviews, so this may change.` : "Here's what I've found so far. I'm still checking more stores and reviews."));
+  } else if (!rec.best) {
     lead.appendChild(el("p", {}, "I couldn't find an option I'd confidently recommend yet."));
     const reasons = [...new Set(rec.products.map((p) => p.ineligibleReason).filter(Boolean))];
     if (reasons.length) lead.appendChild(el("p", { class: "lead-sub" }, `What got in the way: ${reasons.join("; ").toLowerCase()}.`));
@@ -544,6 +566,8 @@ function renderRecommendation(rec, notice) {
     body.appendChild(sec);
   }
 
+  if (partial) return box;
+
   const meta = el("div", { class: "meta" });
   meta.append(icon("clock", 15), el("p", {}, `Checked ${fmtTime(rec.checkedAt)}. Prices and stock change — confirm on the seller's page before buying. ${rec.disclosures.filter((d) => !/^DEMO/.test(d)).join(" ")}`));
   body.appendChild(meta);
@@ -554,9 +578,7 @@ function renderRecommendation(rec, notice) {
   details.appendChild(sum);
   details.appendChild(el("pre", {}, JSON.stringify({ status: rec.status, data_mode: rec.dataMode, checked_at: rec.checkedAt, best: rec.best, alternatives: rec.alternatives, costs: rec.costs, uncertainties: rec.uncertainties, sources: rec.sources }, null, 2)));
   body.appendChild(details);
-
-  chat.appendChild(box);
-  scrollToNode(box);
+  return box;
 }
 
 function renderQuestions(reply) {
@@ -590,6 +612,56 @@ function autosize() {
   else input.style.height = "";
 }
 
+/** Parses a newline-delimited JSON response body as it arrives. */
+async function* ndjson(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buf += decoder.decode(value, { stream: !done });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) yield JSON.parse(line);
+    }
+    if (done) break;
+  }
+  if (buf.trim()) yield JSON.parse(buf);
+}
+
+/** Shows or refreshes the interim results right after the progress card, keeping open details open. */
+function showPartial(prev, after, rec, notice) {
+  const next = buildRecommendation(rec, notice, true);
+  if (prev) {
+    const open = new Set([...prev.querySelectorAll(".card-more[open]")].map((d) => d.closest(".card").dataset.pid));
+    for (const card of next.querySelectorAll(".card[data-pid]")) if (open.has(card.dataset.pid)) card.querySelector(".card-more")?.setAttribute("open", "");
+    prev.replaceWith(next);
+  } else {
+    after.after(next);
+    scrollToNode(after);
+  }
+  return next;
+}
+
+function showReply(data, partial) {
+  if (data.type === "questions") {
+    partial?.remove();
+    draft = data.draft;
+    renderQuestions(data);
+    return;
+  }
+  draft = null;
+  const box = buildRecommendation(data.recommendation, data.notice);
+  // Swap the interim results in place so the reader keeps their spot.
+  if (partial) partial.replaceWith(box);
+  else {
+    chat.appendChild(box);
+    scrollToNode(box);
+  }
+}
+
 async function send(text) {
   if (busy) return;
   addUser(text);
@@ -601,23 +673,36 @@ async function send(text) {
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", accept: "application/x-ndjson" },
       body: JSON.stringify({ message: text, draft, mode }),
       signal: ctrl.signal,
     });
-    const data = await res.json().catch(() => ({}));
-    typing.remove();
-    if (ctrl.signal.aborted) return;
-    if (!res.ok) {
-      addError(data.error ?? "Sorry — something went wrong. Please try again.");
+    if (!res.ok || !/ndjson/.test(res.headers.get("content-type") ?? "")) {
+      const data = await res.json().catch(() => ({}));
+      typing.remove();
+      if (ctrl.signal.aborted) return;
+      if (!res.ok) addError(data.error ?? "Sorry — something went wrong. Please try again.");
+      else showReply(data, null);
       return;
     }
-    if (data.type === "questions") {
-      draft = data.draft;
-      renderQuestions(data);
-    } else {
-      draft = null;
-      renderRecommendation(data.recommendation, data.notice);
+    // Streamed reply: progress lines (stage + results so far), then the final reply.
+    let partial = null;
+    let finished = false;
+    for await (const msg of ndjson(res.body)) {
+      if (ctrl.signal.aborted) return;
+      if (msg.type === "progress") {
+        typing.setStage(msg.stage);
+        if (msg.recommendation?.products.length) partial = showPartial(partial, typing.box, msg.recommendation, msg.notice);
+        continue;
+      }
+      finished = true;
+      typing.remove();
+      if (msg.type === "error") addError(msg.error ?? "Sorry — something went wrong. Please try again.");
+      else showReply(msg, partial);
+    }
+    if (!finished) {
+      typing.remove();
+      addError(partial ? "Research stopped before it finished — the results above are what I'd found so far." : "Sorry — the research stopped unexpectedly. Please try again.");
     }
   } catch {
     typing.remove();

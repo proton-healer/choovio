@@ -13,7 +13,7 @@ import { missingQuestions, parseRequest, type ParseInput } from "./research/inte
 import type { FxRates, FxSource } from "./research/fx.js";
 import type { LlmHelper } from "./research/llm.js";
 import { discoverModels, recordMatchesModel, titleMentionsModel, type DiscoveredModel, type RoundupPage } from "./research/discover.js";
-import { isGuidePage, isLikelyShopPage, reviewQuery, type SearchProvider } from "./research/search.js";
+import { isGuidePage, isLikelyShopPage, reviewQuery, type SearchProvider, type SearchResult } from "./research/search.js";
 import { htmlToText } from "./security/untrusted.js";
 import { parseExternalUrl } from "./security/url.js";
 import type { ClarifyingQuestion, ProductRecord, Recommendation, ShoppingRequest, Source } from "./types.js";
@@ -27,7 +27,19 @@ export interface PipelineDeps {
   now?: () => Date;
   deadlineMs?: number;
   log?: (msg: string) => void;
+  /** Called while research runs with the current stage and the best ranking so far (throttled). */
+  onProgress?: (update: ProgressUpdate) => void;
 }
+
+export type ProgressStage = "searching" | "reading" | "discovering" | "analyzing" | "reviews";
+
+export interface ProgressUpdate {
+  stage: ProgressStage;
+  /** Ranking of what has been verified so far; null until a product is found. */
+  recommendation: Recommendation | null;
+}
+
+const PROGRESS_INTERVAL_MS = 1_200;
 
 export type PipelineResult =
   | { type: "questions"; request: ShoppingRequest; questions: ClarifyingQuestion[] }
@@ -79,6 +91,77 @@ export async function runComparison(input: ParseInput | ShoppingRequest, deps: P
   const failures: { url: string; reason: string }[] = [];
   const notes: string[] = [];
 
+  const records: ProductRecord[] = [];
+  const pageTexts = new Map<string, string>();
+  // Search-found pages with no priced product (category/collection listings): mined for product names below.
+  const listingPages: RoundupPage[] = [];
+
+  // Progress: stage changes and the first product are sent at once, later products at most every PROGRESS_INTERVAL_MS.
+  let stage: ProgressStage = "searching";
+  let lastProgress = 0;
+  let progressTimer: ReturnType<typeof setTimeout> | null = null;
+  let finished = false;
+  let shownProducts = false;
+  const snapshot = (): Recommendation | null => {
+    const shop = records.filter((r) => r.offers.length || !r.reviews.some((x) => x.kind === "independent_review"));
+    if (!shop.length) return null;
+    return buildRecommendation({ request, ranked: rankProducts(mergeRecords(shop), request, null), dataMode: deps.fetcher.mode, checkedAt, failures, notes });
+  };
+  const sendProgress = () => {
+    if (progressTimer) clearTimeout(progressTimer);
+    progressTimer = null;
+    if (finished) return;
+    lastProgress = Date.now();
+    try {
+      const recommendation = snapshot();
+      shownProducts ||= Boolean(recommendation?.products.length);
+      deps.onProgress!({ stage, recommendation });
+    } catch (e) {
+      log(`progress callback failed: ${(e as Error).message}`);
+    }
+  };
+  const progress = (next?: ProgressStage) => {
+    if (!deps.onProgress) return;
+    if (next) {
+      stage = next;
+      return sendProgress();
+    }
+    if (!shownProducts) return sendProgress();
+    if (progressTimer) return;
+    const wait = PROGRESS_INTERVAL_MS - (Date.now() - lastProgress);
+    if (wait <= 0) sendProgress();
+    else progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  const fetchInto = (urls: string[]) => mapLimit(urls, 4, async (url) => {
+    if (records.length >= config.maxProducts * 2) return;
+    try {
+      const page = await withDeadline(deps.fetcher.fetch(url), deadline, `fetching ${hostOf(url)}`);
+      const built = buildFromPage({ url: page.finalUrl, html: page.html, checkedAt: now().toISOString(), dataMode: deps.fetcher.mode, country: request.country });
+      pageTexts.set(page.finalUrl, built.pageText);
+      if (!request.urls.length && !built.products.some((p) => p.offers.length || p.model || p.gtin)) {
+        listingPages.push({ url: page.finalUrl, html: page.html, text: built.pageText });
+        return;
+      }
+      if (!built.products.length) {
+        // Only report as a failure when the user asked for this page explicitly.
+        if (request.urls.length) failures.push({ url, reason: "No product information found on the page" });
+        return;
+      }
+      if (built.pageKind === "independent_review" && request.urls.length) {
+        notes.push(`${hostOf(url)} is a review site, so it was used as review evidence rather than a place to buy`);
+      }
+      records.push(...built.products);
+      progress();
+    } catch (e) {
+      const reason = (e as Error).message;
+      log(`fetch failed ${url}: ${reason}`);
+      if (request.urls.length) failures.push({ url, reason });
+    }
+  });
+
+  progress(request.urls.length ? "reading" : "searching");
+
   // 1. Candidate pages
   let candidates: string[] = [];
   for (const raw of request.urls.slice(0, config.maxProducts)) {
@@ -110,60 +193,50 @@ export async function runComparison(input: ParseInput | ShoppingRequest, deps: P
       };
     }
     const q = `${request.query} buy${whereIfMissing}`;
-    try {
-      const results = await withDeadline(deps.search.search(q, { country: request.country, count: 20 }), deadline, "search");
+    // Each search lane (e.g. legacy and AI search) is read as soon as it answers,
+    // without waiting for the others: at most ten new pages per lane, two per site.
+    const perHost = new Map<string, number>();
+    const seen = new Set<string>();
+    let searching = true;
+    const onResults = async (lane: string, results: SearchResult[]) => {
+      if (!searching) return; // answered after the search deadline
+      log(`${lane} search: ${results.length} results`);
       for (const r of results) searchSnippets.set(r.url, r.snippet);
-      candidates = results.map((r) => r.url).filter((u) => isLikelyShopPage(u) && !isGuidePage(u) && isFetchable(u));
-      guideUrls = guidesFirst(results.map((r) => r.url).filter((u) => isGuidePage(u) && isFetchable(u)));
-      // Prefer diversity: at most two pages per site.
-      const perHost = new Map<string, number>();
-      candidates = candidates.filter((u) => {
+      const picked: string[] = [];
+      for (const u of results.map((r) => r.url)) {
+        if (picked.length >= 10 || seen.has(u) || !isLikelyShopPage(u) || isGuidePage(u) || !isFetchable(u)) continue;
         const h = hostOf(u);
+        if ((perHost.get(h) ?? 0) >= 2) continue;
         perHost.set(h, (perHost.get(h) ?? 0) + 1);
-        return perHost.get(h)! <= 2;
-      }).slice(0, 10);
+        seen.add(u);
+        picked.push(u);
+      }
+      candidates.push(...picked);
+      for (const u of results.map((r) => r.url)) if (isGuidePage(u) && isFetchable(u) && !guideUrls.includes(u)) guideUrls.push(u);
+      if (stage === "searching") progress("reading");
+      await fetchInto(picked);
+    };
+    const opts = { country: request.country, count: 20 };
+    try {
+      if (deps.search.searchEach) await withDeadline(deps.search.searchEach(q, opts, onResults), deadline, "search");
+      else await onResults(deps.search.name, await withDeadline(deps.search.search(q, opts), deadline, "search"));
     } catch (e) {
       notes.push(`Search failed: ${(e as Error).message}`);
+    } finally {
+      searching = false;
     }
+    guideUrls = guidesFirst(guideUrls);
+  } else {
+    // 2. Fetch & extract the pages the user linked
+    await fetchInto(candidates);
   }
-
-  // 2. Fetch & extract
-  const records: ProductRecord[] = [];
-  const pageTexts = new Map<string, string>();
-  // Search-found pages with no priced product (category/collection listings): mined for product names below.
-  const listingPages: RoundupPage[] = [];
-  const fetchInto = (urls: string[]) => mapLimit(urls, 4, async (url) => {
-    if (records.length >= config.maxProducts * 2) return;
-    try {
-      const page = await withDeadline(deps.fetcher.fetch(url), deadline, `fetching ${hostOf(url)}`);
-      const built = buildFromPage({ url: page.finalUrl, html: page.html, checkedAt: now().toISOString(), dataMode: deps.fetcher.mode, country: request.country });
-      pageTexts.set(page.finalUrl, built.pageText);
-      if (!request.urls.length && !built.products.some((p) => p.offers.length || p.model || p.gtin)) {
-        listingPages.push({ url: page.finalUrl, html: page.html, text: built.pageText });
-        return;
-      }
-      if (!built.products.length) {
-        // Only report as a failure when the user asked for this page explicitly.
-        if (request.urls.length) failures.push({ url, reason: "No product information found on the page" });
-        return;
-      }
-      if (built.pageKind === "independent_review" && request.urls.length) {
-        notes.push(`${hostOf(url)} is a review site, so it was used as review evidence rather than a place to buy`);
-      }
-      records.push(...built.products);
-    } catch (e) {
-      const reason = (e as Error).message;
-      log(`fetch failed ${url}: ${reason}`);
-      if (request.urls.length) failures.push({ url, reason });
-    }
-  });
-  await fetchInto(candidates);
 
   // 2b. Searches like "best X under $Y" or gift searches mostly return roundups, gift
   // guides and category pages. When too few priced products turned up, search for
   // the specific products those pages recommend or list.
   let discovered: DiscoveredModel[] = [];
   if (deps.search && !request.urls.length && records.filter((r) => r.offers.length).length < 3 && Date.now() < deadline - 90_000) {
+    progress("discovering");
     try {
       if (!guideUrls.length) {
         const results = await withDeadline(deps.search.search(`best ${request.query}`, { country: request.country, count: 10 }), deadline - 60_000, "guide search");
@@ -208,7 +281,8 @@ export async function runComparison(input: ParseInput | ShoppingRequest, deps: P
   const reviewRecords = records.filter((r) => !shopRecords.includes(r));
 
   // 3. Optional LLM insights (specs/complaints validated against the page text)
-  if (deps.llm) {
+  if (deps.llm && shopRecords.length) {
+    progress("analyzing");
     await mapLimit(shopRecords.slice(0, config.maxProducts), 3, async (rec) => {
       const url = rec.offers[0]?.source.url ?? rec.specs[0]?.source.url;
       const text = url ? pageTexts.get(url) : undefined;
@@ -258,6 +332,7 @@ export async function runComparison(input: ParseInput | ShoppingRequest, deps: P
     }
   }
   if (deps.search && Date.now() < deadline - 45_000) {
+    progress("reviews");
     const preliminary = rankProducts(merged, request, fx).slice(0, 3);
     await mapLimit(preliminary, 3, async (sp) => {
       try {
@@ -285,6 +360,8 @@ export async function runComparison(input: ParseInput | ShoppingRequest, deps: P
   if (Date.now() > deadline) notes.push("Research hit the time limit; some pages may not have been checked");
   const ranked = rankProducts(merged, request, fx);
   const recommendation = buildRecommendation({ request, ranked, dataMode: deps.fetcher.mode, checkedAt, failures, notes });
+  finished = true;
+  if (progressTimer) clearTimeout(progressTimer);
   return { type: "recommendation", recommendation };
 }
 

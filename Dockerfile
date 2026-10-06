@@ -4,7 +4,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-# Listen on all interfaces; the platform sets PORT.
+# Listen on all interfaces; the platform sets PORT (Railway uses 8080).
 ENV HOST=0.0.0.0
-EXPOSE 8787
 CMD ["npx", "tsx", "src/server.ts"]

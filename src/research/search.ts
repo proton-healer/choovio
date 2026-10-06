@@ -1,6 +1,8 @@
 /**
  * Search providers (server-side keys). Pick one with CHOOVIO_SEARCH_PROVIDER, or
  * leave it on "auto" to use the first configured: brave, tavily, serper, openai.
+ * In "auto", when both a legacy key and OPENAI_API_KEY are set, the main product
+ * search runs legacy and AI search in parallel (see ParallelSearchProvider).
  */
 import { config, liveSearchProviderNames } from "../config.js";
 import { INDEPENDENT_REVIEW_HOSTS, hostOf } from "../extraction/product.js";
@@ -15,6 +17,12 @@ export interface SearchResult {
 export interface SearchProvider {
   readonly name: string;
   search(query: string, opts: { country: string | null; count?: number }): Promise<SearchResult[]>;
+  /**
+   * Optional: runs independent search lanes in parallel and hands each lane's
+   * results to `onResults` as soon as that lane finishes. Resolves once every
+   * lane (and its callback) is done; throws only when every lane failed.
+   */
+  searchEach?(query: string, opts: { country: string | null; count?: number }, onResults: (lane: string, results: SearchResult[]) => void | Promise<void>): Promise<void>;
 }
 
 export class SearchHttpError extends Error {
@@ -67,6 +75,45 @@ export class FallbackSearchProvider implements SearchProvider {
     }
     if (empty) return [];
     throw new Error(failures.join("; "));
+  }
+}
+
+/**
+ * Legacy search (Brave/Tavily/Serper) and AI search (OpenAI web search) side by
+ * side. `searchEach` runs every lane at once so the fast lane's results can be
+ * used while the slow one is still working; `search` keeps the cheaper
+ * fallback order (first lane first) for follow-up searches.
+ */
+export class ParallelSearchProvider implements SearchProvider {
+  readonly name: string;
+  private readonly fallback: FallbackSearchProvider;
+  constructor(private readonly lanes: SearchProvider[]) {
+    if (!lanes.length) throw new Error("ParallelSearchProvider needs at least one lane");
+    this.name = lanes.map((l) => l.name).join(" | ");
+    this.fallback = new FallbackSearchProvider(lanes);
+  }
+
+  search(query: string, opts: { country: string | null; count?: number }): Promise<SearchResult[]> {
+    return this.fallback.search(query, opts);
+  }
+
+  async searchEach(query: string, opts: { country: string | null; count?: number }, onResults: (lane: string, results: SearchResult[]) => void | Promise<void>): Promise<void> {
+    const failures: string[] = [];
+    let succeeded = false;
+    await Promise.all(
+      this.lanes.map(async (lane) => {
+        let results: SearchResult[];
+        try {
+          results = await lane.search(query, opts);
+        } catch (err) {
+          failures.push(`${lane.name}: ${(err as Error).message}`);
+          return;
+        }
+        succeeded = true;
+        await onResults(lane.name, results);
+      }),
+    );
+    if (!succeeded) throw new Error(failures.join("; "));
   }
 }
 
@@ -206,7 +253,12 @@ export function createSearchProvider(): SearchProvider | null {
         return new OpenAIWebSearchProvider();
     }
   });
-  return providers.length ? new FallbackSearchProvider(providers) : null;
+  if (!providers.length) return null;
+  const legacy = providers.filter((p) => p.name !== "openai");
+  const ai = providers.filter((p) => p.name === "openai");
+  // Both kinds configured: run them in parallel rather than AI only as a last resort.
+  if (legacy.length && ai.length) return new ParallelSearchProvider([new FallbackSearchProvider(legacy), ...ai]);
+  return new FallbackSearchProvider(providers);
 }
 
 function countryName(code: string): string | null {

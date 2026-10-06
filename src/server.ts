@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { chatTurn, DraftSchema } from "./chat.js";
 import { config, credentialStatus } from "./config.js";
+import type { PipelineDeps } from "./pipeline.js";
 import { DemoSearchProvider, DEMO_NOTICE, demoPages } from "./demo/fixtures.js";
 import { FixtureFetcher, LiveFetcher } from "./research/fetcher.js";
 import { createLlmHelper } from "./research/llm.js";
@@ -88,17 +89,38 @@ async function handleChat(req: http.IncomingMessage, res: http.ServerResponse) {
     return send(res, 400, { error: "Invalid request" });
   }
   if (body.mode === "demo" && !config.demoAllowed) return send(res, 400, { error: "Demo mode is disabled" });
-  const deps =
+  const deps: PipelineDeps =
     body.mode === "demo"
       ? { fetcher: demoFetcher, search: demoSearch, llm: null }
       : { fetcher: liveFetcher, search: liveSearch, llm, fx: liveFx };
+  const notice = body.mode === "demo" ? DEMO_NOTICE : null;
+  if (String(req.headers.accept ?? "").includes("application/x-ndjson")) return streamChat(res, body, deps, notice);
   try {
     const reply = await chatTurn(body.message, body.draft ?? null, deps);
-    send(res, 200, { ...reply, notice: body.mode === "demo" ? DEMO_NOTICE : null });
+    send(res, 200, { ...reply, notice });
   } catch (e) {
     console.error("chat error:", e);
     send(res, 500, { error: "Something went wrong while researching. Please try again." });
   }
+}
+
+/**
+ * Streaming chat: one JSON object per line. `progress` lines carry the stage and
+ * the best results found so far; the last line is the usual reply or an error.
+ */
+async function streamChat(res: http.ServerResponse, body: z.infer<typeof ChatBody>, deps: PipelineDeps, notice: string | null) {
+  res.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store", "x-accel-buffering": "no", ...SECURITY_HEADERS });
+  const line = (obj: unknown) => {
+    if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(obj) + "\n");
+  };
+  try {
+    const reply = await chatTurn(body.message, body.draft ?? null, { ...deps, onProgress: (p) => line({ type: "progress", ...p, notice }) });
+    line({ ...reply, notice });
+  } catch (e) {
+    console.error("chat error:", e);
+    line({ type: "error", error: "Something went wrong while researching. Please try again." });
+  }
+  res.end();
 }
 
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse) {
